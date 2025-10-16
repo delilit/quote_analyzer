@@ -1,0 +1,6 @@
+class Searcher:
+    def __init__(self, logger, rate_limit_calls=10, rate_limit_period=1):
+        self.logger = logger
+        self.rate_limit_calls = rate_limit_calls
+        self.rate_limit_period = rate_limit_period # If we using this variable we must use it insted of 10 and 1 values in @sleep_and_retry lines.
+        
