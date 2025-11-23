@@ -1,3 +1,6 @@
+from crossref_commons.retrieval import get_publication_as_json
+
+from functools import lru_cache
 import re
 from typing import List, Dict, Any
 
@@ -30,3 +33,31 @@ def parse_doi_input(input_text: str, max_dois: int = 200) -> List[str]:
     else:
         print(f"Found {len(unique_dois)} valid and unique DOI(s).")
     return unique_dois
+
+@lru_cache(maxsize=1000)
+def extract_surname_with_initial(author_name: str) -> str:
+    if not author_name or author_name in ['Unknown', 'Error']: return author_name
+    clean_name = re.sub(r'[^\w\s\-\.]', ' ', author_name).strip()
+    parts = clean_name.split()
+    if not parts: return author_name
+    surname = parts[-1]
+    initial = parts[0][0].upper() if parts[0] else ''
+    return f"{surname} {initial}." if initial else surname
+
+#Avarage format parsing
+def get_journal_info(crossref_data: Dict) -> Dict:
+    container_title = crossref_data.get('container-title', [])
+    short_title = crossref_data.get('short-container-title', [])
+    full_name = container_title[0] if container_title else (short_title[0] if short_title else 'Unknown')
+    abbreviation = short_title[0] if short_title else (container_title[0] if container_title else 'Unknown')
+    return {'full_name': full_name, 'abbreviation': abbreviation,
+            'publisher': crossref_data.get('publisher', 'Unknown')}
+
+def get_affiliations_and_countries(openalex_data: Dict) -> tuple[List[str], str]:
+    affiliations, countries = set(), set()
+    for authorship in openalex_data.get('authorships', []):
+        for institution in authorship.get('institutions', []):
+            if name := institution.get('display_name'): affiliations.add(name)
+            if code := institution.get('country_code'): countries.add(code.upper())
+    return list(affiliations) or ['Unknown'], ';'.join(sorted(countries)) or 'Unknown'
+

@@ -1,4 +1,6 @@
+import api as api
 import utils as  utils
+import builder as builder
 
 import requests
 import pandas as pd
@@ -41,6 +43,10 @@ class PerformanceMonitor:
 
 class CitationAnalyzer:
     def __init__(self):
+        #modules
+        self.api = api.APIClient()
+        self.builder = builder.ExcelBuilder()
+
         self.crossref_cache = {}
         self.openalex_cache = {}
         self.performance_monitor = PerformanceMonitor()
@@ -57,63 +63,10 @@ class CitationAnalyzer:
         )
         self.logger = logging.getLogger(__name__)
 
-    @sleep_and_retry
-    @limits(calls=15, period=1)
-    def get_openalex_data(self, doi: str) -> Dict:
-        if doi in self.openalex_cache: return self.openalex_cache[doi]
-        try:
-            url = f"https://api.openalex.org/works/https://doi.org/{doi}"
-            response = requests.get(url, timeout=Config.REQUEST_TIMEOUT)
-            response.raise_for_status()
-            self.openalex_cache[doi] = response.json()
-            return self.openalex_cache[doi]
-        except Exception:
-            self.openalex_cache[doi] = {}
-            return {}
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5))
-    @sleep_and_retry
-    @limits(calls=15, period=1)
-    def get_crossref_data(self, doi: str) -> Dict:
-        if doi in self.crossref_cache: return self.crossref_cache[doi]
-        try:
-            cr = Crossref()
-            self.crossref_cache[doi] = cr.works(ids=doi)['message']
-            return self.crossref_cache[doi]
-        except Exception:
-            self.crossref_cache[doi] = {}
-            return {}
-
-    @lru_cache(maxsize=1000)
-    def extract_surname_with_initial(self, author_name: str) -> str:
-        if not author_name or author_name in ['Unknown', 'Error']: return author_name
-        clean_name = re.sub(r'[^\w\s\-\.]', ' ', author_name).strip()
-        parts = clean_name.split()
-        if not parts: return author_name
-        surname = parts[-1]
-        initial = parts[0][0].upper() if parts[0] else ''
-        return f"{surname} {initial}." if initial else surname
-
-    def get_journal_info(self, crossref_data: Dict) -> Dict:
-        container_title = crossref_data.get('container-title', [])
-        short_title = crossref_data.get('short-container-title', [])
-        full_name = container_title[0] if container_title else (short_title[0] if short_title else 'Unknown')
-        abbreviation = short_title[0] if short_title else (container_title[0] if container_title else 'Unknown')
-        return {'full_name': full_name, 'abbreviation': abbreviation,
-                'publisher': crossref_data.get('publisher', 'Unknown')}
-
-    def get_affiliations_and_countries(self, openalex_data: Dict) -> tuple[List[str], str]:
-        affiliations, countries = set(), set()
-        for authorship in openalex_data.get('authorships', []):
-            for institution in authorship.get('institutions', []):
-                if name := institution.get('display_name'): affiliations.add(name)
-                if code := institution.get('country_code'): countries.add(code.upper())
-        return list(affiliations) or ['Unknown'], ';'.join(sorted(countries)) or 'Unknown'
-
     def get_combined_article_data(self, doi: str) -> Dict[str, Any]:
         try:
-            crossref_data = self.get_crossref_data(doi)
-            openalex_data = self.get_openalex_data(doi)
+            crossref_data = self.api.get_crossref_data(doi)
+            openalex_data = self.api.get_openalex_data(doi)
 
             title = openalex_data.get('title') or (
                 crossref_data.get('title', [])[0] if crossref_data.get('title') else 'Unknown')
@@ -121,10 +74,10 @@ class CitationAnalyzer:
 
             authors = [auth.get('author', {}).get('display_name', 'Unknown') for auth in
                        openalex_data.get('authorships', [])]
-            authors_with_initials = [self.extract_surname_with_initial(name) for name in authors]
+            authors_with_initials = [utils.extract_surname_with_initial(name) for name in authors]
 
-            journal_info = self.get_journal_info(crossref_data)
-            affiliations, countries = self.get_affiliations_and_countries(openalex_data)
+            journal_info = utils.get_journal_info(crossref_data)
+            affiliations, countries = utils.get_affiliations_and_countries(openalex_data)
 
             return {
                 'DOI': doi,
@@ -152,7 +105,7 @@ class CitationAnalyzer:
     def get_citing_articles_from_openalex(self, doi: str) -> List[str]:
         citing_dois = []
         try:
-            work_data = self.get_openalex_data(doi)
+            work_data = self.api.get_openalex_data(doi)
             work_id = work_data.get('id')
             if not work_id or work_data.get('cited_by_count', 0) == 0:
                 return []
@@ -222,42 +175,111 @@ class CitationAnalyzer:
             final_dataframes_dict[source_doi] = df
 
         return final_dataframes_dict
+#new function
 
-    # ОБНОВЛЕННАЯ ФУНКЦИЯ СОХРАНЕНИЯ
-    def save_citation_analysis_to_excel(self, source_articles_df: pd.DataFrame,
-                                        citing_dataframes_dict: Dict[str, pd.DataFrame]) -> str:
+    def get_cited_dois_for_source(self, source_doi: str) -> List[str]:
+        """
+        Возвращает список DOI, на которые ссылается статья source_doi (через Crossref references).
+        Использует APIClient.get_references_from_crossref и utils.normalize_doi / validate_doi.
+        """
+        refs = []
         try:
-            timestamp = int(time.time())
-            excel_path = os.path.join(tempfile.gettempdir(), f"citation_analysis_results_{timestamp}.xlsx")
-            wb = Workbook()
-            wb.remove(wb.active)
-
-            # Создаем ПЕРВЫЙ лист с метаданными исходной статьи
-            ws_source = wb.create_sheet("Сведения об указанных статьях", 0)
-            if not source_articles_df.empty:
-                for r in dataframe_to_rows(source_articles_df, index=False, header=True):
-                    ws_source.append(r)
-            else:
-                ws_source.append(["Данные не найдены"])
-
-            # В цикле создаем по одному листу для каждого исходного DOI
-            for source_doi, citing_df in citing_dataframes_dict.items():
-                # Создаем безопасное имя для листа, заменяя недопустимые символы
-                safe_sheet_name = f"Цитирования {source_doi.replace('/', '_')}"
-                safe_sheet_name = safe_sheet_name[:31]  # Ограничение Excel на длину имени листа
-
-                ws = wb.create_sheet(safe_sheet_name)
-                if not citing_df.empty:
-                    for r in dataframe_to_rows(citing_df, index=False, header=True):
-                        ws.append(r)
-                else:
-                    ws.append([f"Цитирований статьи с DOI: {source_doi} не найдено"])
-
-            wb.save(excel_path)
-            return excel_path
+            ref_list = self.api.get_references_from_crossref(source_doi)
+            for r in ref_list:
+                # Crossref reference может иметь ключи 'DOI', 'doi', 'doi-raw' и т.п.
+                cand = None
+                for key in ('DOI', 'doi', 'doi-raw', 'DOI-raw'):
+                    if r.get(key):
+                        cand = r.get(key)
+                        break
+                if not cand:
+                    # иногда Crossref кладёт doi в поле 'unstructured' или 'article-title' - пропускаем
+                    continue
+                norm = utils.normalize_doi(str(cand))
+                if norm and utils.validate_doi(norm):
+                    refs.append(norm)
         except Exception as e:
-            self.logger.critical(f"Critical error in save_citation_analysis_to_excel: {e}")
-            return "error_creating_report"
+            self.logger.error(f"Error fetching references for {source_doi}: {e}")
+        return refs
+
+    def process_cited_articles_parallel(self, doi_list: List[str]) -> Dict[str, pd.DataFrame]:
+        """
+        Для каждого DOI из doi_list собирает DOI'ы, на которые он ссылается,
+        затем параллельно получает метаданные для всех уникальных ссылок и
+        формирует словарь {source_doi: DataFrame(ссылки)}.
+        Возвращает словарь DataFrame'ов (ключи — исходные DOI).
+        """
+        self.performance_monitor.start()
+        print("🔍 Step 1: Сбор ссылок (references) для указанных DOI...")
+        cited_map = {}  # source_doi -> list of referenced DOI
+        for i, doi in enumerate(doi_list, 1):
+            print(f"📥 [{i}/{len(doi_list)}] Получаем references для: {doi}")
+            refs = self.get_cited_dois_for_source(doi)
+            refs_unique = sorted(set(refs))
+            cited_map[doi] = refs_unique
+            print(f"   → Найдено ссылок: {len(refs_unique)}")
+
+        all_referenced = {d for refs in cited_map.values() for d in refs}
+        if not all_referenced:
+            print("Не найдено ни одной ссылки в Crossref для предоставленных DOI.")
+            return {doi: pd.DataFrame() for doi in doi_list}
+
+        print(f"🔍 Step 2: Всего уникальных ссылок для обработки: {len(all_referenced)}. Собираем метаданные параллельно...")
+
+        fetched_map = {}
+        with ThreadPoolExecutor(max_workers=Config.MAX_WORKERS) as executor:
+            future_to_doi = {executor.submit(self.get_combined_article_data, doi): doi for doi in all_referenced}
+            for future in tqdm(as_completed(future_to_doi), total=len(future_to_doi), desc="Обработка ссылок"):
+                src_doi = future_to_doi[future]
+                try:
+                    meta = future.result()
+                    # meta должна содержать ключ 'DOI'
+                    fetched_map[meta.get('DOI', src_doi)] = meta
+                except Exception as e:
+                    fetched_map[src_doi] = {'DOI': src_doi, 'Название статьи': 'Error', 'error': str(e)}
+
+        # Для каждого исходного DOI собираем DataFrame его ссылок
+        result_frames = {}
+        for source, refs in cited_map.items():
+            rows = [fetched_map[r] for r in refs if r in fetched_map]
+            df = pd.DataFrame(rows)
+            df.replace('Unknown', '-', inplace=True)
+            result_frames[source] = df
+
+        return result_frames
+    
+def analyze_cited_articles(doi_input_text: str):
+    analyzer = CitationAnalyzer()
+    doi_list = utils.parse_doi_input(doi_input_text)
+    if not doi_list:
+        return
+
+    print("\nStarting OUTBOUND references analysis (DOIs that the provided DOIs cite)...")
+    try:
+        print("🔍 Fetching metadata for source article(s)...")
+        source_articles_df = analyzer.get_source_articles_data(doi_list)
+
+        # Новая функция вернёт словарь DataFrame'ов: для каждого исходного DOI — DataFrame его references
+        cited_dataframes_dict = analyzer.process_cited_articles_parallel(doi_list)
+
+        total_references_found = sum(len(df) for df in cited_dataframes_dict.values())
+
+        if total_references_found > 0:
+            stats = analyzer.performance_monitor.get_stats()
+            print(f"\n{'=' * 80}\nANALYSIS RESULTS (OUTBOUND REFERENCES)\n{'=' * 80}")
+            print(f"Total source articles analyzed: {len(doi_list)}")
+            print(f"Total unique referenced articles found: {total_references_found}")
+            print(f"Total processing time: {stats.get('elapsed_seconds', 0):.2f} seconds")
+
+            excel_name = analyzer.builder.save_excel(source_articles_df, cited_dataframes_dict)
+            print(f"\nAnalysis saved to: {excel_name}")
+        else:
+            print("No outbound references with valid DOIs found for any provided DOI.")
+
+    except Exception as e:
+        print(f"A critical error occurred: {e}")
+        analyzer.builder.save_excel(pd.DataFrame(), {})
+        print("An error report has been generated.")
 
 
 def analyze_citing_articles(doi_input_text: str):
@@ -284,16 +306,15 @@ def analyze_citing_articles(doi_input_text: str):
             print(f"Total unique citing articles relationships found: {total_citations_found}")
             print(f"Total processing time: {stats.get('elapsed_seconds', 0):.2f} seconds")
 
-            excel_name = analyzer.save_citation_analysis_to_excel(source_articles_df, citing_dataframes_dict)
+            excel_name = analyzer.builder.save_excel(source_articles_df, citing_dataframes_dict)
             print(f"\nAnalysis saved to: {excel_name}")
         else:
             print("No citing articles found for any of the provided DOIs.")
 
     except Exception as e:
         print(f"A critical error occurred: {e}")
-        analyzer.save_citation_analysis_to_excel(pd.DataFrame(), {})
+        analyzer.builder.save_excel(pd.DataFrame(), {})
         print("An error report has been generated.")
-
 
 if __name__ == "__main__":
     # Пример с двумя DOI для демонстрации
@@ -302,4 +323,6 @@ if __name__ == "__main__":
     10.1016/j.jalgebra.2016.05.025
     10.1126/science.adi1887
     """
-    analyze_citing_articles(doi_input)
+    #analyze_citing_articles(doi_input)
+    analyze_cited_articles(doi_input)
+    
