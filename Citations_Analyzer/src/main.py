@@ -1,6 +1,6 @@
-import api as api
-import utils as  utils
-import builder as builder
+from src import builder
+from src import utils
+from src import api
 
 import requests
 import pandas as pd
@@ -252,7 +252,7 @@ def analyze_cited_articles(doi_input_text: str):
     analyzer = CitationAnalyzer()
     doi_list = utils.parse_doi_input(doi_input_text)
     if not doi_list:
-        return
+        return ""
 
     print("\nStarting OUTBOUND references analysis (DOIs that the provided DOIs cite)...")
     try:
@@ -273,13 +273,17 @@ def analyze_cited_articles(doi_input_text: str):
 
             excel_name = analyzer.builder.save_excel(source_articles_df, cited_dataframes_dict)
             print(f"\nAnalysis saved to: {excel_name}")
+            return excel_name
         else:
             print("No outbound references with valid DOIs found for any provided DOI.")
+
+        return ""
 
     except Exception as e:
         print(f"A critical error occurred: {e}")
         analyzer.builder.save_excel(pd.DataFrame(), {})
         print("An error report has been generated.")
+        return ""
 
 
 def analyze_citing_articles(doi_input_text: str):
