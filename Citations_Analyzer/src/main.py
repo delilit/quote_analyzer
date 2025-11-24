@@ -323,6 +323,7 @@ if __name__ == "__main__":
     10.1016/j.jalgebra.2016.05.025
     10.1126/science.adi1887
     """
-    #analyze_citing_articles(doi_input)
-    analyze_cited_articles(doi_input)
+    
+    analyze_citing_articles(doi_input)
+    #analyze_cited_articles(doi_input)
     
