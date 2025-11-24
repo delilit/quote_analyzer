@@ -1,5 +1,3 @@
-from crossref_commons.retrieval import get_publication_as_json
-
 from functools import lru_cache
 import re
 from typing import List, Dict, Any
