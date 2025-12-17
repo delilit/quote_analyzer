@@ -3,11 +3,9 @@ import os
 import re
 import tempfile
 from collections import Counter
-from itertools import islice
 from typing import List, Tuple
 
 # Частые служебные слова — исключаются из анализа
-
 STOPWORDS = set("""
 a an the and or of for to in on at from into onto about over under as by is are be
 with without within between among that this those these their its it's his her was
@@ -16,7 +14,6 @@ if then but so not nor than such both because however although though while duri
 """.split())
 
 # Русские тоже добавим, если вдруг
-
 STOPWORDS.update("""
 и в во не что от до над под при про по из за же ли но а о е я ты мы он она они оно
 """.split())
@@ -64,8 +61,7 @@ def get_ngrams(words: List[str], n: int) -> List[Tuple[str, ...]]:
 
 def analyze_titles_from_excel(excel_path: str,
     top_n_words: int = 15,
-    top_n_phrases: int = 15,
-    output_to_txt: bool = True) -> str:
+    top_n_phrases: int = 15) -> str:
     """
     Загружает excel, извлекает названия статей со всех листов,
     анализирует частоту слов и словосочетаний, сохраняет результат в txt.
@@ -119,37 +115,16 @@ def analyze_titles_from_excel(excel_path: str,
     trigram_counter = Counter(trigrams).most_common(top_n_phrases)
 
     # Формируем текст отчёта
-    result_lines = []
-    result_lines.append(f"АНАЛИЗ ФАЙЛА: {excel_path}\n")
-    result_lines.append("="*80 + "\n")
-
-    result_lines.append("ТОП КЛЮЧЕВЫХ СЛОВ:\n")
+    result_lines = ["Топ ключевых слов:\n"]
     for w, c in top_words:
         result_lines.append(f"{w}: {c}")
 
-    result_lines.append("\nТОП БИГРАММ:\n")
+    result_lines.append("\n\nТоп биграмм:\n")
     for bg, c in bigram_counter:
         result_lines.append(f"{' '.join(bg)}: {c}")
 
-    result_lines.append("\nТОП ТРИГРАММ:\n")
+    result_lines.append("\n\nТоп триграмм:\n")
     for tg, c in trigram_counter:
         result_lines.append(f"{' '.join(tg)}: {c}")
 
-    result_txt = "\n".join(result_lines)
-
-    if not output_to_txt:
-        return result_txt
-
-    # Сохранение в txt
-    filename = os.path.join(
-        tempfile.gettempdir(),
-        f"text_analysis_results_{os.path.basename(excel_path)}.txt"
-    )
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(result_txt)
-
-    return filename
-
-if __name__ == "__main__":
-    path = r"C:\Users\Aleksey\AppData\Local\Temp\citation_analysis_results_1763990289.xlsx"
-    print(analyze_titles_from_excel(path))
+    return "\n".join(result_lines)
