@@ -251,8 +251,6 @@ class CitationAnalyzer:
 def analyze_cited_articles(doi_input_text: str):
     analyzer = CitationAnalyzer()
     doi_list = utils.parse_doi_input(doi_input_text)
-    if not doi_list:
-        return ""
 
     print("\nStarting OUTBOUND references analysis (DOIs that the provided DOIs cite)...")
     try:
@@ -289,8 +287,6 @@ def analyze_cited_articles(doi_input_text: str):
 def analyze_citing_articles(doi_input_text: str):
     analyzer = CitationAnalyzer()
     doi_list = utils.parse_doi_input(doi_input_text)
-    if not doi_list:
-        return
 
     print("\nStarting analysis...")
     try:
@@ -312,13 +308,16 @@ def analyze_citing_articles(doi_input_text: str):
 
             excel_name = analyzer.builder.save_excel(source_articles_df, citing_dataframes_dict)
             print(f"\nAnalysis saved to: {excel_name}")
+            return excel_name
         else:
             print("No citing articles found for any of the provided DOIs.")
+            return ''
 
     except Exception as e:
         print(f"A critical error occurred: {e}")
         analyzer.builder.save_excel(pd.DataFrame(), {})
         print("An error report has been generated.")
+        return ''
 
 if __name__ == "__main__":
     # Пример с двумя DOI для демонстрации

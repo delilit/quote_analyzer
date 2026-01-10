@@ -1,76 +1,95 @@
 import asyncio
 import concurrent.futures
 import logging
-from IPython.core.error import TryNext
-from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.context import FSMContext
 from aiogram.filters.command import CommandStart
-from aiogram.methods import SendMessage
-from aiogram.types import BufferedInputFile
+from aiogram.filters import StateFilter
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from os import path, remove
 
-from src.main import CitationAnalyzer, analyze_cited_articles
+from src.main import CitationAnalyzer, analyze_cited_articles, analyze_citing_articles
+from src.utils import parse_doi_input
 from src.builder import ExcelBuilder
 from src.metadata_analysis import summarize_from_excel
 from src.analyzer_from_excel import analyze_titles_from_excel
+
+
+class AnalysisStates(StatesGroup):
+    got_correct_doi = State()
+    waiting_for_analysis_type = State()
+    analyzing = State()
+
 
 api_token = '8365621029:AAHwS8jb4qbpRZkKPDNYZtyAnMPb-YgraeA'
 
 logging.basicConfig(level=logging.INFO)
 
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 analyzer = CitationAnalyzer
 excel_builder = ExcelBuilder()
 
+# Inline-клавиатура выбора типа анализа.
+analysis_type_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text='Статьи, цитирующие предоставленные статьи',
+                callback_data='analysis_citing'
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text='Статьи, цитированные предоставленными статьями',
+                callback_data='analysis_cited'
+            )
+        ]
+    ]
+)
+
+
 # Обработчик команды /start
 @dp.message(CommandStart())
-async def start_command(message: types.Message):
+async def start_command(message: types.Message, state: FSMContext):
     await message.answer(
         'Здравствуйте! Я - бот для анализа DOI.\n\n'  
         'Для начала работы отправьте один или несколько DOI через пробел.\n'
         'Пример: 10.1126/science.adi1887 10.1038/s41586-023-06924-6'
     )
 
-# Обработчик сообщений, не содержащих команду
+    await state.clear()
+
+
+# Обработчик сообщений, не содержащих команду, ожидающий массив DOI
 @dp.message(F.text)
-async def process_doi_input(message: types.Message):
+async def process_doi_input(message: types.Message, state: FSMContext):
     try:
         input_text = message.text.strip()
 
-        # Игнорируем сообщения-команды
+        # Игнорируем сообщения-команды.
         if input_text.startswith('/'):
             return ''
 
-        # Сообщение о том, что процесс начался, которое после завершения анализа будет удалено.
-        wip_message = await message.answer('Анализирую статьи...')
+        doi_list = parse_doi_input(input_text)
+        if not doi_list:
+            await message.answer('Некорректный формат DOI.\n'
+                                 'Пример: 10.1126/science.adi1887 10.1038/s41586-023-06924-6')
+            return ''
 
-        # Т.к. analyze_cited_articles не асинхронная функция, для неё нужно выделить поток вручную.
-        # Если удаётся провести анализ DOI, Excel-файл сохраняется в папку временных файлов.
-        # В переменную excel_file_path запишется путь к файлу.
-        loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            excel_file_path = await loop.run_in_executor(
-                pool, analyze_cited_articles, input_text
+        # Сохраняем DOI в состоянии.
+        await state.set_state(AnalysisStates.got_correct_doi)
+        await state.update_data(doi_list=input_text)
+
+        # Отправка inline-клавиатуры с выбором статей, которые нужно проанализировать.
+        analysis_types_message = await message.answer(
+                'Выберите, какие статьи анализировать:',
+                reply_markup=analysis_type_keyboard
             )
-
-        if excel_file_path == '':
-            await wip_message.delete()
-            await message.answer('Произошла ошибка. Проверьте введённые данные и попробуйте ещё раз.')
-            return ''
-
-        await wip_message.delete()
-        for msg in await analyze_metadata(excel_file_path):
-            await message.answer(msg)
-
-        await message.answer(await analyze_words_frequency(excel_file_path))
-
-        analysed_successfully = await send_excel_file(message, excel_file_path)
-
-        if analysed_successfully == '':
-            await message.answer('Произошла ошибка при отправке файла.')
-            await delete_temp_file(excel_file_path)
-            return ''
-
-        await delete_temp_file(excel_file_path)
+        await state.set_state(AnalysisStates.waiting_for_analysis_type)
+        await state.update_data(message=analysis_types_message)
         return ''
 
     except Exception as e:
@@ -80,7 +99,71 @@ async def process_doi_input(message: types.Message):
         return ''
 
 
-async def send_excel_file(message: types.Message, file_path):
+@dp.callback_query(StateFilter(AnalysisStates.waiting_for_analysis_type))
+async def process_analysis_type_choice(callback_query: types.CallbackQuery, state: FSMContext):
+    try:
+        # Получаем сохранённые данные из состояния и удаляем сообщение с клавиатурой.
+        data = await state.get_data()
+        doi_input = data.get('doi_list', '')
+        await data.get('message').delete()
+
+
+        if callback_query.data.startswith('analysis_'):
+            # Сообщение о том, что процесс начался, которое после завершения анализа будет удалено.
+            wip_message = await callback_query.message.answer('Анализирую статьи...')
+
+            if callback_query.data == 'analysis_citing':
+                caption_phrase = 'цитирующих их статей'
+                # Т.к. analyze_citing_articles не асинхронная функция, для неё нужно выделить поток вручную.
+                # Если удаётся провести анализ DOI, Excel-файл сохраняется в папку временных файлов.
+                # В переменную excel_file_path запишется путь к файлу.
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    excel_file_path = await loop.run_in_executor(
+                        pool, analyze_citing_articles, doi_input
+                    )
+
+            elif callback_query.data == 'analysis_cited':
+                caption_phrase = 'цитированных ими статей'
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    excel_file_path = await loop.run_in_executor(
+                        pool, analyze_cited_articles, doi_input
+                    )
+
+            if excel_file_path == '':
+                await wip_message.delete()
+                await callback_query.message.answer('Произошла ошибка. Проверьте введённые данные и попробуйте ещё раз.')
+                return ''
+
+            await wip_message.delete()
+            for msg in await analyze_metadata(excel_file_path):
+                await callback_query.message.answer(msg)
+
+            await callback_query.message.answer(await analyze_words_frequency(excel_file_path))
+
+            analysed_successfully = await send_excel_file(callback_query.message, excel_file_path, caption_phrase)
+
+            if analysed_successfully == '':
+                await callback_query.message.answer('Произошла ошибка при отправке файла.')
+                await delete_temp_file(excel_file_path)
+                return ''
+
+            await delete_temp_file(excel_file_path)
+            return ''
+
+
+        logging.error('Incorrect callback query value')
+        await callback_query.message.answer('Произошла ошибка при обработке запроса. Попробуйте ещё раз.')
+        return ''
+
+    except Exception as e:
+        logging.error(f'Error processing callback query: {e}')
+        await callback_query.message.answer('Произошла ошибка при обработке запроса. Попробуйте ещё раз.')
+        return ''
+
+
+async def send_excel_file(message: types.Message, file_path, caption_phrase):
     try:
         # Проверка, входит ли размер полученного файла в ограничение Telegram.
         file_size_gb = path.getsize(file_path) / (1024 ** 3)
@@ -95,8 +178,7 @@ async def send_excel_file(message: types.Message, file_path):
         # Рассматриваем файл в бинарном формате.
         file_data = open(file_path, 'rb').read()
         input_file = BufferedInputFile(file_data, filename = path.basename(file_path))
-        await message.answer_document(input_file, caption='Анализ данных статей + цитированных'
-                                                         ' и цитирующих статей')
+        await message.answer_document(input_file, caption=f'Полный анализ предоставленных и {caption_phrase}')
         return 1
 
     except Exception as e:
